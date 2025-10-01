@@ -2,6 +2,8 @@
 
 A powerful, easy-to-use C++ GUI library for building desktop applications with minimal code!
 
+![image](IMG_5669.JPG)
+
 ## ✨ Features
 
 ### 🎨 **Core Widgets**
