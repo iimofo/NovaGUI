@@ -17,10 +17,17 @@
 #define STB_EASY_FONT_IMPLEMENTATION
 #include "stb_easy_font.h"
 
+// Include STB Image for loading image files
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 #include <cstring>
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <map>
+#include <string>
 
 namespace tinygui {
 
@@ -66,12 +73,56 @@ struct InputState {
     int selAnchor;
     bool selecting;
     double blinkStart;
+    float scrollOffset; // Horizontal scroll offset for long text
     
     InputState() {
         text[0] = 0;
         caret = selAnchor = 0;
         selecting = false;
         blinkStart = 0.0;
+        scrollOffset = 0.0f;
+    }
+};
+
+// Image data structure
+struct ImageData {
+    unsigned int textureID;
+    int width, height;
+    bool loaded;
+    
+    ImageData() : textureID(0), width(0), height(0), loaded(false) {}
+};
+
+// Multi-line text area state
+struct TextAreaState {
+    char text[TINYGUI_MAX_TEXT * 4]; // Larger buffer for multi-line
+    int caret;
+    int selAnchor;
+    bool selecting;
+    double blinkStart;
+    float scrollY;
+    
+    TextAreaState() {
+        text[0] = 0;
+        caret = selAnchor = 0;
+        selecting = false;
+        blinkStart = 0.0;
+        scrollY = 0.0f;
+    }
+};
+
+// Modal dialog state
+struct ModalState {
+    bool visible;
+    char title[256];
+    char message[512];
+    int result; // 0=none, 1=ok, 2=cancel, 3=yes, 4=no
+    int type;   // 0=alert, 1=confirm, 2=yesno
+    
+    ModalState() {
+        visible = false;
+        title[0] = message[0] = 0;
+        result = type = 0;
     }
 };
 
@@ -95,6 +146,12 @@ struct Context {
     int hoveredMenu;         // -1 = none, 0+ = menu index
     float menuBarHeight;
     int pendingMenuResult;   // Store menu result for automatic handling
+    
+    // Image system
+    std::map<std::string, ImageData> imageCache;
+    
+    // Modal dialog system
+    ModalState modal;
 };
 
 static Context ctx;
@@ -290,6 +347,71 @@ inline bool pointInRect(float px, float py, float x, float y, float w, float h) 
     return px >= x && px <= x + w && py >= y && py <= y + h;
 }
 
+// Forward declarations for functions that need to be defined later
+inline void drawModalDialog();
+inline void image(float x, float y, float w, float h, const char* name);
+inline int tabBar(float x, float y, float w, float h, const char** tabNames, int tabCount, int& activeTab);
+
+// ==================== Modal Dialog System (definitions moved later) ====================
+// Modal dialog function declarations (implementations after widgets)
+inline void alert(const char* title, const char* message);
+inline bool confirm(const char* title, const char* message);
+inline bool isModalVisible();
+
+// ==================== Image System ====================
+// Image loading function declarations (implementations after widgets)
+inline bool loadImageFromData(const char* name, unsigned char* pixels, int width, int height) {
+    ImageData& img = ctx.imageCache[name];
+    if (img.loaded) return true;
+    
+    glGenTextures(1, &img.textureID);
+    glBindTexture(GL_TEXTURE_2D, img.textureID);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    img.width = width; img.height = height; img.loaded = true;
+    return true;
+}
+
+inline bool createTestImage(const char* name, int size = 64) {
+    unsigned char* pixels = new unsigned char[size * size * 4];
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            int idx = (y * size + x) * 4;
+            bool checker = ((x / 8) + (y / 8)) % 2 == 0;
+            pixels[idx + 0] = checker ? 255 : 100;
+            pixels[idx + 1] = checker ? 100 : 255;
+            pixels[idx + 2] = 100;
+            pixels[idx + 3] = 255;
+        }
+    }
+    bool result = loadImageFromData(name, pixels, size, size);
+    delete[] pixels;
+    return result;
+}
+
+// Load image from file (PNG, JPG, BMP, TGA, etc.)
+inline bool loadImageFromFile(const char* name, const char* filepath) {
+    int width, height, channels;
+    unsigned char* pixels = stbi_load(filepath, &width, &height, &channels, 4); // Force RGBA
+    
+    if (!pixels) {
+        printf("Failed to load image: %s\n", filepath);
+        return false;
+    }
+    
+    bool result = loadImageFromData(name, pixels, width, height);
+    stbi_image_free(pixels);
+    
+    if (result) {
+        printf("Successfully loaded image: %s (%dx%d)\n", filepath, width, height);
+    }
+    
+    return result;
+}
+
 // ==================== GUI Widgets ====================
 inline void label(float x, float y, const char* text, float scale = TINYGUI_LABEL_SCALE, const Color& color = THEME_TEXT) {
     glPushMatrix();
@@ -309,6 +431,15 @@ inline void label(float x, float y, const char* text, float scale = TINYGUI_LABE
     glPopMatrix();
 }
 
+// Helper function to calculate minimum button size for text + padding
+inline void getMinButtonSize(const char* text, float& minW, float& minH, float padding = 8.0f) {
+    const float s = TINYGUI_LABEL_SCALE;
+    int tw = stb_easy_font_width((char*)text);
+    int th = stb_easy_font_height((char*)text);
+    minW = tw * s + 2 * padding;
+    minH = th * s + 2 * padding;
+}
+
 inline bool button(float x, float y, float w, float h, const char* text) {
     // Hit-test in window coords (no Y flip)
     bool hovered = pointInRect(ctx.mouseX, ctx.mouseY, x, y, w, h);
@@ -326,11 +457,98 @@ inline bool button(float x, float y, float w, float h, const char* text) {
     int th = stb_easy_font_height((char*)text);
     float textW = tw * s;
     float textH = th * s;
+    
+    // Always center text perfectly within the button bounds
     float tx = x + (w - textW) * 0.5f;
     float ty = y + (h - textH) * 0.5f;
+    
     label(tx, ty, text, s);
 
     return hovered && ctx.mousePressed;
+}
+
+// Auto-sizing button that expands to fit text + padding
+inline bool autoButton(float x, float y, const char* text, float padding = 8.0f) {
+    float w, h;
+    getMinButtonSize(text, w, h, padding);
+    return button(x, y, w, h, text);
+}
+
+// ==================== Vertical Sidebar Tabs ====================
+// Vertical sidebar tab system for left-side navigation
+
+// Single vertical tab button
+inline bool verticalTab(float x, float y, float w, float h, const char* text, bool isActive, bool showIcon = false) {
+    bool hovered = pointInRect(ctx.mouseX, ctx.mouseY, x, y, w, h);
+    bool pressed = hovered && ctx.mouseDown;
+    
+    // Choose colors based on state
+    Color bgColor;
+    if (isActive) {
+        bgColor = THEME_BUTTON_ACTIVE;
+    } else if (hovered) {
+        bgColor = THEME_BUTTON_HOVER;
+    } else {
+        bgColor = Color(0.2f, 0.2f, 0.2f, 1.0f); // Darker sidebar background
+    }
+    
+    // Draw tab background
+    drawRect(x, y, w, h, bgColor);
+    
+    // Draw active indicator (left border)
+    if (isActive) {
+        drawRect(x, y, 3.0f, h, COLOR_CYAN); // Accent color for active tab
+    }
+    
+    // Draw text (rotated or horizontal depending on preference)
+    const float s = 1.8f; // Slightly smaller text for sidebar
+    float textW = measureTextWidth(text, s);
+    float textH = measureTextHeight(text, s);
+    
+    // Center text in the tab
+    float tx = x + (w - textW) * 0.5f;
+    float ty = y + (h - textH) * 0.5f;
+    
+    Color textColor = isActive ? THEME_TEXT : (hovered ? THEME_TEXT : THEME_TEXT_DIM);
+    label(tx, ty, text, s, textColor);
+    
+    // Draw separator line at bottom
+    drawLine(x + 5, y + h, x + w - 5, y + h, THEME_TEXT_DIM, 0.5f);
+    
+    return hovered && ctx.mousePressed;
+}
+
+// Vertical sidebar tab bar
+inline int verticalTabBar(float x, float y, float w, const char** tabNames, int tabCount, int& activeTab, float tabHeight = 50.0f) {
+    if (tabCount <= 0) return -1;
+    
+    // Draw sidebar background
+    int windowW, windowH;
+    glfwGetWindowSize(ctx.window, &windowW, &windowH);
+    float sidebarHeight = windowH - y;
+    drawRect(x, y, w, sidebarHeight, Color(0.15f, 0.15f, 0.15f, 1.0f));
+    
+    int clickedTab = -1;
+    
+    for (int i = 0; i < tabCount; i++) {
+        float tabY = y + i * tabHeight;
+        bool isActive = (i == activeTab);
+        
+        if (verticalTab(x, tabY, w, tabHeight, tabNames[i], isActive)) {
+            activeTab = i;
+            clickedTab = i;
+        }
+    }
+    
+    // Draw right border of sidebar
+    drawLine(x + w, y, x + w, y + sidebarHeight, THEME_TEXT_DIM, 1.0f);
+    
+    return clickedTab;
+}
+
+// Helper function to get sidebar width
+inline float getSidebarWidth() {
+    return 120.0f; // Standard sidebar width
 }
 
 // ==================== Input Box (with caret & selection) ====================
@@ -344,6 +562,7 @@ inline bool input(float x, float y, float w, float h, InputState& inputState, co
     const float s = TINYGUI_LABEL_SCALE;
     const float padX = 5.0f, padY = 5.0f;
     const float lineH = 8.0f * s;
+    const float textAreaW = w - 2 * padX;
 
     // Precompute character widths for current text
     float charWidths[TINYGUI_MAX_TEXT]{};
@@ -351,14 +570,34 @@ inline bool input(float x, float y, float w, float h, InputState& inputState, co
     float totalTextWidth = 0.0f;
     int len = computeCharWidths(inputState.text, s, charWidths, cumWidths, TINYGUI_MAX_TEXT - 1, &totalTextWidth);
 
+    // Calculate caret position and adjust scroll offset
     auto caretXAt = [&](int idx) -> float {
-        if (idx <= 0) return x + padX;
-        if (idx >= len) return x + padX + totalTextWidth;
-        return x + padX + cumWidths[idx];
+        if (idx <= 0) return 0.0f;
+        if (idx >= len) return totalTextWidth;
+        return cumWidths[idx];
     };
 
+    // Ensure caret is visible by adjusting scroll offset
+    if (isActive) {
+        float caretPos = caretXAt(inputState.caret);
+        float visibleStart = inputState.scrollOffset;
+        float visibleEnd = inputState.scrollOffset + textAreaW;
+        
+        // Scroll right if caret is beyond visible area
+        if (caretPos > visibleEnd - 10) {
+            inputState.scrollOffset = caretPos - textAreaW + 10;
+        }
+        // Scroll left if caret is before visible area
+        else if (caretPos < visibleStart + 10) {
+            inputState.scrollOffset = std::max(0.0f, caretPos - 10);
+        }
+        
+        // Clamp scroll offset
+        inputState.scrollOffset = std::max(0.0f, std::min(inputState.scrollOffset, std::max(0.0f, totalTextWidth - textAreaW)));
+    }
+
     auto indexFromX = [&](float mouseX) -> int {
-        float lx = mouseX - (x + padX);
+        float lx = (mouseX - (x + padX)) + inputState.scrollOffset;
         if (lx <= 0.0f) return 0;
         if (lx >= totalTextWidth) return len;
         
@@ -397,21 +636,27 @@ inline bool input(float x, float y, float w, float h, InputState& inputState, co
     // Draw box
     const Color& inputColor = isActive ? THEME_INPUT_ACTIVE : THEME_INPUT;
     drawRect(x, y, w, h, inputColor);
+    
+    // Enable scissor test for text clipping
+    glEnable(GL_SCISSOR_TEST);
+    int windowW, windowH;
+    glfwGetWindowSize(ctx.window, &windowW, &windowH);
+    glScissor((int)(x + padX), windowH - (int)(y + h - padY), (int)textAreaW, (int)(h - 2 * padY));
 
     // Draw selection (behind text)
     if (isActive && hasSelection(&inputState)) {
         int a = std::min(inputState.selAnchor, inputState.caret);
         int b = std::max(inputState.selAnchor, inputState.caret);
-        float selX0 = caretXAt(a);
-        float selX1 = caretXAt(b);
+        float selX0 = x + padX + caretXAt(a) - inputState.scrollOffset;
+        float selX1 = x + padX + caretXAt(b) - inputState.scrollOffset;
 
         drawRect(selX0, y + padY, selX1 - selX0, lineH, THEME_SELECTION);
     }
 
     // Draw text or hint
     if (inputState.text[0] != 0) {
-        label(x + padX, y + padY, inputState.text, s, THEME_TEXT);
-    } else if (hint[0] != 0) {
+        label(x + padX - inputState.scrollOffset, y + padY, inputState.text, s, THEME_TEXT);
+    } else if (hint[0] != 0 && !isActive) {
         label(x + padX, y + padY, hint, s, THEME_TEXT_DIM);
     }
 
@@ -420,10 +665,16 @@ inline bool input(float x, float y, float w, float h, InputState& inputState, co
         double t = glfwGetTime();
         bool showCaret = fmod(t - inputState.blinkStart, 1.0) < 0.5;
         if (showCaret) {
-            float cx = caretXAt(inputState.caret);
+            float cx = x + padX + caretXAt(inputState.caret) - inputState.scrollOffset;
             drawLine(cx, y + padY, cx, y + padY + lineH, THEME_TEXT);
         }
     }
+    
+    // Disable scissor test
+    glDisable(GL_SCISSOR_TEST);
+    
+    // Draw input border
+    drawRectOutline(x, y, w, h, isActive ? THEME_TEXT : THEME_TEXT_DIM, 1.0f);
 
     return isActive;
 }
@@ -470,10 +721,18 @@ inline bool slider(float x, float y, float w, float h, float& value, float minVa
         value = minValue + t * (maxValue - minValue);
     }
     
+    // Ensure proper OpenGL state for drawing
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
     // Draw track
     float trackY = y + h * 0.4f;
     float trackH = h * 0.2f;
     drawRect(x, trackY, w, trackH, THEME_INPUT);
+    
+    // Draw track outline to make it more visible
+    drawRectOutline(x, trackY, w, trackH, THEME_TEXT_DIM, 1.0f);
     
     // Draw handle
     float t = (value - minValue) / (maxValue - minValue);
@@ -492,6 +751,11 @@ inline bool slider(float x, float y, float w, float h, float& value, float minVa
 inline void progressBar(float x, float y, float w, float h, float progress, const Color& fillColor = COLOR_GREEN) {
     progress = std::max(0.0f, std::min(1.0f, progress));
     
+    // Ensure proper OpenGL state for drawing
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
     // Draw background
     drawRect(x, y, w, h, THEME_INPUT);
     
@@ -502,6 +766,136 @@ inline void progressBar(float x, float y, float w, float h, float progress, cons
     
     // Draw border
     drawRectOutline(x, y, w, h, THEME_TEXT, 1.0f);
+}
+
+// ==================== List & Dropdown Widgets ====================
+// List box widget
+inline int listBox(float x, float y, float w, float h, const char** items, int itemCount, int& selectedIndex) {
+    if (itemCount <= 0) return -1;
+    
+    // Draw list background
+    drawRect(x, y, w, h, THEME_INPUT);
+    drawRectOutline(x, y, w, h, THEME_TEXT, 1.0f);
+    
+    float itemHeight = 25.0f;
+    int visibleItems = (int)(h / itemHeight);
+    int clickedItem = -1;
+    
+    // Enable clipping
+    glEnable(GL_SCISSOR_TEST);
+    int windowW, windowH;
+    glfwGetWindowSize(ctx.window, &windowW, &windowH);
+    glScissor((int)x, windowH - (int)(y + h), (int)w, (int)h);
+    
+    for (int i = 0; i < itemCount && i < visibleItems; i++) {
+        float itemY = y + i * itemHeight;
+        bool hovered = pointInRect(ctx.mouseX, ctx.mouseY, x, itemY, w, itemHeight);
+        bool isSelected = (i == selectedIndex);
+        
+        // Item background
+        if (isSelected) {
+            drawRect(x, itemY, w, itemHeight, THEME_SELECTION);
+        } else if (hovered) {
+            drawRect(x, itemY, w, itemHeight, THEME_BUTTON_HOVER);
+        }
+        
+        // Item text
+        label(x + 5, itemY + 3, items[i], 1.8f, THEME_TEXT);
+        
+        // Handle click
+        if (hovered && ctx.mousePressed) {
+            selectedIndex = i;
+            clickedItem = i;
+        }
+    }
+    
+    glDisable(GL_SCISSOR_TEST);
+    return clickedItem;
+}
+
+// Dropdown widget
+inline int dropdown(float x, float y, float w, float h, const char** items, int itemCount, int& selectedIndex, bool& isOpen) {
+    if (itemCount <= 0) return -1;
+    
+    // Main dropdown button
+    bool buttonHovered = pointInRect(ctx.mouseX, ctx.mouseY, x, y, w, h);
+    const Color& buttonColor = buttonHovered ? THEME_BUTTON_HOVER : THEME_INPUT;
+    drawRect(x, y, w, h, buttonColor);
+    drawRectOutline(x, y, w, h, THEME_TEXT, 1.0f);
+    
+    // Selected item text
+    if (selectedIndex >= 0 && selectedIndex < itemCount) {
+        label(x + 5, y + 3, items[selectedIndex], 1.8f, THEME_TEXT);
+    } else {
+        label(x + 5, y + 3, "Select...", 1.8f, THEME_TEXT_DIM);
+    }
+    
+    // Dropdown arrow
+    float arrowSize = 8.0f;
+    float arrowX = x + w - arrowSize - 5;
+    float arrowY = y + h * 0.5f;
+    label(arrowX, arrowY - arrowSize * 0.5f, "v", 1.5f, THEME_TEXT);
+    
+    // Toggle dropdown on click
+    if (buttonHovered && ctx.mousePressed) {
+        isOpen = !isOpen;
+    }
+    
+    int clickedItem = -1;
+    
+    // Draw dropdown list if open
+    if (isOpen) {
+        float listY = y + h;
+        float listH = std::min((float)itemCount * 25.0f, 150.0f);
+        
+        // Draw list background
+        drawRect(x, listY, w, listH, THEME_INPUT);
+        drawRectOutline(x, listY, w, listH, THEME_TEXT, 1.0f);
+        
+        // Enable clipping for list
+        glEnable(GL_SCISSOR_TEST);
+        int windowW, windowH;
+        glfwGetWindowSize(ctx.window, &windowW, &windowH);
+        glScissor((int)x, windowH - (int)(listY + listH), (int)w, (int)listH);
+        
+        for (int i = 0; i < itemCount; i++) {
+            float itemY = listY + i * 25.0f;
+            bool hovered = pointInRect(ctx.mouseX, ctx.mouseY, x, itemY, w, 25.0f);
+            bool isSelected = (i == selectedIndex);
+            
+            // Item background
+            if (isSelected) {
+                drawRect(x, itemY, w, 25.0f, THEME_SELECTION);
+            } else if (hovered) {
+                drawRect(x, itemY, w, 25.0f, THEME_BUTTON_HOVER);
+            }
+            
+            // Item text
+            label(x + 5, itemY + 3, items[i], 1.8f, THEME_TEXT);
+            
+            // Handle click
+            if (hovered && ctx.mousePressed) {
+                selectedIndex = i;
+                clickedItem = i;
+                isOpen = false; // Close dropdown
+            }
+        }
+        
+        glDisable(GL_SCISSOR_TEST);
+        
+        // Close dropdown if clicked outside
+        if (ctx.mousePressed && !pointInRect(ctx.mouseX, ctx.mouseY, x, y, w, h + listH)) {
+            isOpen = false;
+        }
+    }
+    
+    return clickedItem;
+}
+
+// Simple dropdown without state management
+inline int simpleDropdown(float x, float y, float w, float h, const char** items, int itemCount, int& selectedIndex) {
+    static bool isOpen = false;
+    return dropdown(x, y, w, h, items, itemCount, selectedIndex, isOpen);
 }
 
 // ==================== Layout Management ====================
@@ -760,10 +1154,180 @@ inline int easyMenuBar() {
     return getMenuResult(); // Returns result from previous frame
 }
 
+// ==================== Function Implementations ====================
+// Modal Dialog implementations
+inline void alert(const char* title, const char* message) {
+    strncpy(ctx.modal.title, title, sizeof(ctx.modal.title) - 1);
+    strncpy(ctx.modal.message, message, sizeof(ctx.modal.message) - 1);
+    ctx.modal.type = 0; // Alert
+    ctx.modal.visible = true;
+    ctx.modal.result = 0;
+}
+
+inline bool confirm(const char* title, const char* message) {
+    if (!ctx.modal.visible) {
+        strncpy(ctx.modal.title, title, sizeof(ctx.modal.title) - 1);
+        strncpy(ctx.modal.message, message, sizeof(ctx.modal.message) - 1);
+        ctx.modal.type = 1; // Confirm
+        ctx.modal.visible = true;
+        ctx.modal.result = 0;
+    }
+    return ctx.modal.result == 1;
+}
+
+inline bool isModalVisible() {
+    return ctx.modal.visible;
+}
+
+inline void drawModalDialog() {
+    if (!ctx.modal.visible) return;
+    
+    int windowW, windowH;
+    glfwGetWindowSize(ctx.window, &windowW, &windowH);
+    
+    // Draw overlay
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    Color overlay(0.0f, 0.0f, 0.0f, 0.5f);
+    drawRect(0, 0, (float)windowW, (float)windowH, overlay);
+    
+    // Dialog dimensions
+    float dialogW = 400.0f;
+    float dialogH = 200.0f;
+    float dialogX = (windowW - dialogW) * 0.5f;
+    float dialogY = (windowH - dialogH) * 0.5f;
+    
+    // Draw dialog background
+    drawRect(dialogX, dialogY, dialogW, dialogH, THEME_INPUT);
+    drawRectOutline(dialogX, dialogY, dialogW, dialogH, THEME_TEXT, 2.0f);
+    
+    // Title bar
+    drawRect(dialogX, dialogY, dialogW, 30.0f, THEME_BUTTON);
+    label(dialogX + 10, dialogY + 5, ctx.modal.title, 2.0f, THEME_TEXT);
+    
+    // Message
+    label(dialogX + 20, dialogY + 50, ctx.modal.message, 2.0f, THEME_TEXT);
+    
+    // Buttons
+    float buttonW = 80.0f;
+    float buttonH = 30.0f;
+    float buttonY = dialogY + dialogH - buttonH - 20.0f;
+    
+    if (ctx.modal.type == 0) { // Alert
+        float buttonX = dialogX + (dialogW - buttonW) * 0.5f;
+        if (button(buttonX, buttonY, buttonW, buttonH, "OK")) {
+            ctx.modal.visible = false;
+            ctx.modal.result = 1;
+        }
+    } else if (ctx.modal.type == 1) { // Confirm
+        float okX = dialogX + dialogW * 0.3f - buttonW * 0.5f;
+        float cancelX = dialogX + dialogW * 0.7f - buttonW * 0.5f;
+        
+        if (button(okX, buttonY, buttonW, buttonH, "OK")) {
+            ctx.modal.visible = false;
+            ctx.modal.result = 1;
+        }
+        if (button(cancelX, buttonY, buttonW, buttonH, "Cancel")) {
+            ctx.modal.visible = false;
+            ctx.modal.result = 2;
+        }
+    }
+    
+    if (glfwGetKey(ctx.window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+        ctx.modal.visible = false;
+        ctx.modal.result = 2;
+    }
+    
+    glDisable(GL_BLEND);
+}
+
+// Image system implementations
+inline void image(float x, float y, float w, float h, const char* name) {
+    auto it = ctx.imageCache.find(name);
+    if (it == ctx.imageCache.end() || !it->second.loaded) {
+        drawRect(x, y, w, h, COLOR_DARK_GRAY);
+        drawRectOutline(x, y, w, h, COLOR_RED, 2.0f);
+        label(x + 5, y + 5, "IMG?", 1.0f, COLOR_RED);
+        return;
+    }
+    
+    ImageData& img = it->second;
+    
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, img.textureID);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.0f, 0.0f); glVertex2f(x, y);
+    glTexCoord2f(1.0f, 0.0f); glVertex2f(x + w, y);
+    glTexCoord2f(1.0f, 1.0f); glVertex2f(x + w, y + h);
+    glTexCoord2f(0.0f, 1.0f); glVertex2f(x, y + h);
+    glEnd();
+    
+    glDisable(GL_BLEND);
+    glDisable(GL_TEXTURE_2D);
+}
+
+// Tab system implementations
+inline int tabBar(float x, float y, float w, float h, const char** tabNames, int tabCount, int& activeTab) {
+    if (tabCount <= 0) return -1;
+    
+    float tabWidth = w / tabCount;
+    int clickedTab = -1;
+    
+    for (int i = 0; i < tabCount; i++) {
+        float tabX = x + i * tabWidth;
+        bool isActive = (i == activeTab);
+        bool hovered = pointInRect(ctx.mouseX, ctx.mouseY, tabX, y, tabWidth, h);
+        
+        Color tabColor = isActive ? THEME_BUTTON_ACTIVE : (hovered ? THEME_BUTTON_HOVER : THEME_BUTTON);
+        drawRect(tabX, y, tabWidth, h, tabColor);
+        
+        if (isActive) {
+            drawRectOutline(tabX, y, tabWidth, h, THEME_TEXT, 2.0f);
+        } else {
+            drawRectOutline(tabX, y, tabWidth, h, THEME_TEXT_DIM, 1.0f);
+        }
+        
+        float textW = measureTextWidth(tabNames[i], 1.8f);
+        float textX = tabX + (tabWidth - textW) * 0.5f;
+        float textY = y + (h - measureTextHeight(tabNames[i], 1.8f)) * 0.5f;
+        label(textX, textY, tabNames[i], 1.8f, THEME_TEXT);
+        
+        if (hovered && ctx.mousePressed) {
+            activeTab = i;
+            clickedTab = i;
+        }
+    }
+    
+    return clickedTab;
+}
+
+inline void beginTabContent(float x, float y, float w, float h) {
+    drawRect(x, y, w, h, THEME_INPUT);
+    drawRectOutline(x, y, w, h, THEME_TEXT, 1.0f);
+    
+    glEnable(GL_SCISSOR_TEST);
+    int windowW, windowH;
+    glfwGetWindowSize(ctx.window, &windowW, &windowH);
+    glScissor((int)x, windowH - (int)(y + h), (int)w, (int)h);
+}
+
+inline void endTabContent() {
+    glDisable(GL_SCISSOR_TEST);
+}
+
 // Define endFrame here after menu functions are available
 inline void endFrame() { 
     // Automatically draw dropdown menus at the end of frame
     ctx.pendingMenuResult = standardMenuDropdowns();
+    
+    // Draw modal dialogs on top of everything
+    drawModalDialog();
+    
     glfwSwapBuffers(ctx.window); 
 }
 
